@@ -6,6 +6,7 @@ import os
 import re
 import secrets
 import stat
+import sys
 import threading
 import time
 from pathlib import Path
@@ -98,7 +99,11 @@ def shared_client(factory) -> httpx.Client:
 
 
 class TransientAPIError(RuntimeError):
-    """Overload or gateway failure: the same request may succeed later."""
+    """Overload or gateway failure (429/5xx): the same request may succeed later, and
+    it is the only failure that may switch to the configured fallback model."""
+
+
+ProviderUnavailable = TransientAPIError
 
 
 class VisionAPI:
@@ -110,6 +115,15 @@ class VisionAPI:
             raise ValueError(
                 "Model is outside the dedicated allowed-model list; no API request sent"
             )
+        fallback = (config.get("MONTAGE_FALLBACK_MODEL") or "").strip()
+        if fallback == config["MONTAGE_MODEL"]:
+            fallback = ""
+        if fallback and allowed and fallback not in allowed:
+            raise ValueError(
+                "Fallback model is outside the dedicated allowed-model list; no API request sent"
+            )
+        self.fallback_model = fallback or None
+        self.fallback_used = False
         self.config = config
         self.calls = 0
         self.usage = []
@@ -121,6 +135,7 @@ class VisionAPI:
             k: self.config[k] for k in ("MONTAGE_BASE_URL", "MONTAGE_MODEL", "MONTAGE_API_MODE")
         }
         identity["MONTAGE_REASONING_EFFORT"] = self.config.get("MONTAGE_REASONING_EFFORT", "low")
+        identity["MONTAGE_FALLBACK_MODEL"] = self.fallback_model or ""
         return identity
 
     def request(self, prompt: str, frames: list[tuple[Path, float]]) -> dict:
@@ -141,7 +156,22 @@ class VisionAPI:
                 content.append({"type": "input_image", "image_url": url, "detail": "high"})
             else:
                 content.append({"type": "image_url", "image_url": {"url": url, "detail": "high"}})
-        payload = {"model": self.config["MONTAGE_MODEL"], "stream": True}
+        models = [self.config["MONTAGE_MODEL"]] + [self.fallback_model] * bool(self.fallback_model)
+        for model_index, model in enumerate(models):
+            try:
+                return self._request_model(model, mode, content, slot, images)
+            except TransientAPIError as exc:
+                if model_index + 1 == len(models):
+                    raise
+                self.fallback_used = True
+                print(
+                    f"[video-montage] provider error with {model} ({exc}); "
+                    f"falling back to {models[model_index + 1]}",
+                    file=sys.stderr,
+                )
+
+    def _request_model(self, model, mode, content, slot, images) -> dict:
+        payload = {"model": model, "stream": True}
         output_limit = int(self.config.get("MONTAGE_MAX_OUTPUT_TOKENS", "8192"))
         if not 1024 <= output_limit <= 32768:
             raise ValueError("MONTAGE_MAX_OUTPUT_TOKENS must be between 1024 and 32768")
@@ -161,7 +191,7 @@ class VisionAPI:
             )
             endpoint = "/chat/completions"
             effort = self.config.get("MONTAGE_REASONING_EFFORT", "low")
-            if "deepseek" in self.config["MONTAGE_MODEL"].lower():
+            if "deepseek" in model.lower():
                 payload["thinking"] = {"type": "disabled" if effort == "none" else "enabled"}
                 if effort != "none":
                     payload["reasoning_effort"] = effort
@@ -203,9 +233,11 @@ class VisionAPI:
                     time.sleep(2)
                     continue
                 if response.status_code in (429, 500, 502, 503, 504):
-                    raise TransientAPIError(f"Vision API HTTP {response.status_code}; retry later")
+                    raise TransientAPIError(f"Vision API HTTP {response.status_code} from {model}")
                 if response.status_code != 200:
-                    raise RuntimeError(f"Vision API HTTP {response.status_code}; no model fallback")
+                    raise RuntimeError(
+                        f"Vision API HTTP {response.status_code} from {model}; not retried"
+                    )
                 text, usage = self._read(response)
             # Keep portable accounting, not gateway-specific per-item attribution payloads.
             self.usage.append(
@@ -224,7 +256,7 @@ class VisionAPI:
                 }
             )
             return parse_json(text)
-        raise RuntimeError("Vision API retry exhausted")
+        raise TransientAPIError(f"Vision API retry exhausted for {model}")
 
     @staticmethod
     def _read(response: httpx.Response) -> tuple[str, dict]:

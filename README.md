@@ -1,12 +1,45 @@
-> This fork adds a ready-to-use [precision montage analyzer](Docs/precision-mode.md):
-> all source frames, up to 10 parallel vision requests, independent boundary checks,
-> resumable accounting and a [Hermes skill](hermes-skill/SKILL.md).
+# skleyka
+
+Находит каждую склейку в видео с точностью до кадра и объясняет монтаж: какой план,
+что сменилось, какой переход, какие приёмы стоит повторить. Каждый кадр ролика уходит
+в vision-модель, каждая граница проверяется независимо ещё дважды.
+
+*Finds every cut in a video to the exact frame and explains the edit, using a vision LLM
+on all source frames with independent re-checks of every boundary.*
+
+- **Точность:** F1 0.99 на эталоне из 76 склеек, медианная ошибка 0 мс (Kimi K3, кадры 320 px).
+- **Скорость:** часовой ролик 720p/25 fps целиком — 5,6 минуты на 6-ядерном сервере:
+  кадры нарезаются параллельно, анализ начинается, пока остальная часть ещё готовится,
+  до 800 одновременных запросов.
+- **Надёжность:** журнал запросов в SQLite, прерванный прогон продолжается без повторной оплаты;
+  перегрузка API (429/5xx) повторяется с паузами и не обрывает прогон.
+
+```bash
+pip install .
+cat > ~/.config/video-montage/config.env <<'CFG'
+MONTAGE_API_KEY=your-dashscope-key
+MONTAGE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+MONTAGE_MODEL=kimi-k3
+MONTAGE_API_MODE=chat_completions
+MONTAGE_REASONING_EFFORT=none
+CFG
+chmod 600 ~/.config/video-montage/config.env
+video-montage precision video.mp4 -o out/ --transcript subtitles.json   # или --transcribe
+```
+
+Результат: `out/report.html`, `report.md`, `montage.csv`, `shots.csv`, `result.json`.
+Подробности режима — [Docs/precision-mode.md](Docs/precision-mode.md), навык для агента
+Hermes — [hermes-skill/SKILL.md](hermes-skill/SKILL.md).
+
+## Основа
+
+skleyka построена на [OpenSceneSense](https://github.com/ymrohit/openscenesense)
+(Rohit Yelukati Mahendra, MIT). Исходная библиотека и её режимы остаются доступны;
+её описание ниже.
+
+---
 
 # OpenSceneSense
-
-> **Video montage fork:** shot-aware multi-image API analysis, dense transition evidence,
-> timed transcripts, resumable runs and a Hermes skill. See [fork documentation](Docs/montage-fork.md).
-> Default deployment uses DeepSeek V4.1 Flash (`deepseek-flash`) through a dedicated API key.
 
 Turn video into structured, timestamped scene intelligence without installing a local ML stack.
 

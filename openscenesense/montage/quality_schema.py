@@ -58,16 +58,19 @@ def validate_window(data, window):
     rows = data.get("boundaries", [])
     if not isinstance(rows, list):
         raise ValueError("Boundary list is invalid")
-    for row in rows:
-        if not isinstance(row, dict) or row.get("id") not in expected or row["id"] in verdicts:
-            raise ValueError("Unknown or duplicate candidate ID")
+    # An unknown or repeated ID drops only those rows: the candidate then counts as missing
+    # and still gets two independent reviews, instead of one slip failing the whole run.
+    ids = [row.get("id") if isinstance(row, dict) else None for row in rows]
+    ids = [i if isinstance(i, str) else None for i in ids]
+    usable = [r for r, i in zip(rows, ids, strict=True) if i in expected and ids.count(i) == 1]
+    for row in usable:
         verdicts[row["id"]] = validate_verdict(row, expected[row["id"]], window)
     events = data.get("events", [])
     if not isinstance(events, list):
         raise ValueError("Invalid event list")
+    # Events are single-pass observations; one with an unknown kind is dropped, not fatal.
+    events = [e for e in events if isinstance(e, dict) and e.get("kind") in EVENT_KINDS]
     for event in events:
-        if not isinstance(event, dict) or event.get("kind") not in EVENT_KINDS:
-            raise ValueError("Invalid event kind")
         a, b = event.get("start_ref"), event.get("end_ref")
         refs([a, b], window)
         if a > b or not isinstance(event.get("description"), str):
@@ -98,6 +101,8 @@ def validate_window(data, window):
         "extra_boundaries": proposals,
         "uncertainties": uncertainty,
         "missing_candidates": sorted(set(expected) - verdicts.keys()),
+        "discarded_boundary_rows": len(rows) - len(usable),
+        "discarded_events": len(data.get("events", [])) - len(events),
     }
 
 

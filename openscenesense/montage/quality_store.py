@@ -29,7 +29,9 @@ class Store:
         self.guard = threading.Lock()
         self.db = sqlite3.connect(path, check_same_thread=False)
         self.db.execute("PRAGMA journal_mode=WAL")
-        self.db.execute("PRAGMA synchronous=FULL")
+        # WAL+NORMAL survives a process crash; FULL fsyncs every commit under the shared lock,
+        # which convoys hundreds of request threads behind the disk.
+        self.db.execute("PRAGMA synchronous=NORMAL")
         self.db.executescript("""
             CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL);
             CREATE TABLE IF NOT EXISTS attempts (
@@ -51,6 +53,10 @@ class Store:
         )
         self.db.commit()
         self.max_calls, self.max_tokens = max_calls, max_tokens
+        # Budget checks use running totals: rescanning the ledger per request is quadratic.
+        totals = self._summary()
+        self.calls, self.accounted = totals["attempts"], totals["accounted_tokens"]
+        self.reserved = {}
 
     def cached(self, task):
         with self.guard:
@@ -87,10 +93,9 @@ class Store:
 
     def begin(self, task, reservation):
         with self.guard:
-            summary = self._summary()
-            if summary["attempts"] >= self.max_calls:
+            if self.calls >= self.max_calls:
                 raise BudgetReached("Cumulative --max-calls reached; raise it explicitly to resume")
-            if summary["accounted_tokens"] + reservation > self.max_tokens:
+            if self.accounted + reservation > self.max_tokens:
                 raise BudgetReached(
                     "Cumulative --max-tokens reservation reached; raise it explicitly to resume"
                 )
@@ -99,10 +104,16 @@ class Store:
                 (task, time.time(), reservation),
             )
             self.db.commit()
+            self.calls += 1
+            self.accounted += reservation
+            self.reserved[cursor.lastrowid] = reservation
             return cursor.lastrowid
 
     def finish(self, attempt, task, value, usage, error=None):
         with self.guard:
+            counts = tokens(usage) if usage else None
+            if counts is not None:
+                self.accounted += counts[0] + counts[1] - self.reserved.pop(attempt, 0)
             self.db.execute(
                 "UPDATE attempts SET finished=?,status=?,usage=?,error=? WHERE id=?",
                 (time.time(), "failed" if error else "complete", json.dumps(usage), error, attempt),

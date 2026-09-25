@@ -134,6 +134,18 @@ def test_missing_candidate_is_recoverable_but_invalid_anchor_is_rejected(tmp_pat
         validate_window({"summary": "x", "boundaries": [v]}, w)
 
 
+def test_unknown_or_repeated_ids_and_bad_events_drop_rows_not_the_window(tmp_path):
+    w = next(w for w in plan_fixture(tmp_path)["windows"] if len(w["candidates"]) == 2)
+    first, second = w["candidates"]
+    event = {"kind": "made_up", "start_ref": 1, "end_ref": 2, "description": "x"}
+    rows = [verdict(first), verdict(first), verdict(second), {**verdict(second), "id": "c9"}]
+    value = validate_window({"summary": "x", "boundaries": rows, "events": [event]}, w)
+    assert [v["id"] for v in value["boundaries"]] == [second["id"]]
+    assert value["missing_candidates"] == [first["id"]]
+    assert value["discarded_boundary_rows"] == 3
+    assert value["events"] == [] and value["discarded_events"] == 1
+
+
 def test_parallelism_preserves_payloads_and_resume_costs_zero(tmp_path):
     results, hashes = [], []
     for workers in (1, 10):
@@ -154,6 +166,32 @@ def test_parallelism_preserves_payloads_and_resume_costs_zero(tmp_path):
     assert results[1]["quality_status"] == "reviewed"
     assert results[1]["analyzed_frames"] == 40
     assert FakeAPI.peak > 1
+
+
+def test_windows_published_one_by_one_match_a_ready_plan(tmp_path):
+    class TrickleFeed:
+        error, done = None, False
+
+        def __init__(self, count):
+            self.left = list(range(count))
+
+        def take(self, timeout=None):
+            fresh, self.left = self.left[:1], self.left[1:]
+            self.done = not self.left
+            return fresh
+
+    runs = []
+    for name, feed in (("ready", None), ("trickle", TrickleFeed)):
+        output = tmp_path / name
+        output.mkdir()
+        FakeAPI.requests = []
+        plan = plan_fixture(output)
+        runner = Runner(args_fixture(output), plan, {}, [], FakeAPI)
+        result = runner.analyze(feed and feed(len(plan["windows"])))
+        runs.append((sorted(FakeAPI.requests), result["boundaries"], result["status"]))
+        runner.store.close()
+    assert runs[0] == runs[1]
+    assert runs[1][2] == "complete"
 
 
 def test_omitted_primary_verdicts_get_two_independent_reviews(tmp_path):

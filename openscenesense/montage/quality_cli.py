@@ -4,12 +4,13 @@ import argparse
 import math
 import signal
 import sys
+import threading
 from pathlib import Path
 
 from .cli import load_transcript, lock
 from .media import run
 from .provider import DEFAULT_CONFIG, load_config
-from .quality_plan import prepare
+from .quality_plan import start_plan
 from .quality_report import render
 from .quality_runner import Runner
 
@@ -22,10 +23,15 @@ def main(argv=None):
     parser.add_argument("video", type=Path)
     parser.add_argument("-o", "--output", type=Path, required=True)
     parser.add_argument("--prepare-only", action="store_true")
-    parser.add_argument("--workers", type=int, default=10)
+    parser.add_argument(
+        "--workers",
+        type=int,
+        default=800,
+        help="Simultaneous requests; DashScope kimi-k3 starts returning 429 near 1000",
+    )
     parser.add_argument("--core-frames", type=int, default=48)
     parser.add_argument("--context-frames", type=int, default=8)
-    parser.add_argument("--frame-size", type=int, default=960)
+    parser.add_argument("--frame-size", type=int, default=320)
     parser.add_argument("--threshold", type=float, default=27)
     parser.add_argument(
         "--source-offset",
@@ -33,19 +39,18 @@ def main(argv=None):
         default=0,
         help="Seconds to add to input presentation times; never resamples frames",
     )
-    parser.add_argument("--max-duration", type=float, default=1800)
-    parser.add_argument("--max-frames-total", type=int, default=120000)
+    parser.add_argument("--max-duration", type=float, default=14400)
+    parser.add_argument("--max-frames-total", type=int, default=400000)
     parser.add_argument(
         "--max-calls",
         type=int,
-        default=300,
-        help="Cumulative across resumes in this output directory",
+        help="Cumulative across resumes in this output directory; default 150 per window",
     )
     parser.add_argument(
         "--max-tokens",
         type=int,
-        default=20000000,
-        help="Cumulative known tokens plus conservative reservations; not a provider billing cap",
+        help="Cumulative known tokens plus conservative reservations; not a provider billing "
+        "cap; default never binds before --max-calls",
     )
     parser.add_argument("--config", type=Path, default=DEFAULT_CONFIG)
     parser.add_argument("--model")
@@ -63,7 +68,7 @@ def main(argv=None):
     )
     args = parser.parse_args(argv)
     if not (
-        1 <= args.workers <= 10
+        1 <= args.workers <= 2000
         and 4 <= args.core_frames <= 60
         and 1 <= args.context_frames <= 16
         and args.core_frames + 2 * args.context_frames <= 64
@@ -74,22 +79,27 @@ def main(argv=None):
         and 0 < args.threshold <= 255
         and math.isfinite(args.max_duration)
         and args.max_duration > 0
-        and args.max_calls > 0
-        and args.max_tokens > 0
+        and (args.max_calls is None or args.max_calls > 0)
+        and (args.max_tokens is None or args.max_tokens > 0)
         and args.max_frames_total > 0
     ):
         parser.error("Invalid limits; core frames plus both context margins must not exceed 64")
     args.output = args.output.expanduser().resolve()
     try:
         with lock(args.output):
-            plan = prepare(args)
+            stop = threading.Event()
+            plan, feed = start_plan(args, stop)
             print(
-                f"Prepared {len(plan['frames'])} source frames, "
-                f"{len(plan['windows'])} windows, "
-                f"{len(plan['candidates'])} boundary candidates",
+                f"Preparing {len(plan['frames'])} source frames in {len(plan['windows'])} "
+                "windows; analysis starts as windows become ready",
                 flush=True,
             )
             if args.prepare_only:
+                while not feed.done:
+                    feed.take(1)
+                if feed.error is not None:
+                    raise feed.error
+                print(f"Prepared {len(plan['candidates'])} boundary candidates", flush=True)
                 return 0
             config = load_config(args.config)
             if args.model:
@@ -117,12 +127,20 @@ def main(argv=None):
                     }
                     for s in transcript
                 ]
+            if args.max_calls is None:
+                # Candidates are still being detected; 150 covers a cut on every frame of a
+                # 48-frame window (one primary plus two reviews each) with retries to spare.
+                args.max_calls = 150 * len(plan["windows"])
+            if args.max_tokens is None:
+                per_call = (args.core_frames + 2 * args.context_frames) * 4096 + 65536
+                args.max_tokens = args.max_calls * per_call
             runner = Runner(args, plan, config, transcript)
+            runner.stop = stop
             previous = {}
             for signum in (signal.SIGINT, signal.SIGTERM):
-                previous[signum] = signal.signal(signum, lambda *_: runner.stop.set())
+                previous[signum] = signal.signal(signum, lambda *_: stop.set())
             try:
-                result = runner.analyze()
+                result = runner.analyze(feed)
                 render(plan, result, args.output)
             finally:
                 runner.store.close()

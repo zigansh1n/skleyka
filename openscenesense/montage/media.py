@@ -357,3 +357,77 @@ def audio_energy(path: Path, workdir: Path) -> dict:
         }
     finally:
         pcm.unlink(missing_ok=True)
+
+
+def video_start_offset(path: Path) -> float:
+    """Seconds from the container start to the first video frame, the clock -ss uses."""
+    info = json.loads(
+        run(
+            [
+                "ffprobe", "-v", "error", "-select_streams", "v:0",
+                "-show_entries", "stream=start_time:format=start_time", "-of", "json", str(path),
+            ]
+        )
+    )  # fmt: skip
+    return float(info["streams"][0].get("start_time") or 0) - float(
+        info["format"].get("start_time") or 0
+    )
+
+
+def extract_segment(job: tuple) -> None:
+    """Decode frames [a, b) to dest/fNNNNNNNN.jpg; segments after the first also decode
+    frame a-1 into dest/seams for the byte-identity check in finish_segment."""
+    source, times, base, a, b, dest, size = job
+    if a == 0:
+        seek, first, count, pattern = [], 0, b, str(dest / "f%08d.jpg")
+    else:
+        # Input-side -ss decodes from the previous keyframe and drops frames before the
+        # target; a target between two presentation timestamps makes the first frame exact.
+        seek = ["-ss", f"{base + (times[a - 2] + times[a - 1]) / 2:.6f}"]
+        first, count, pattern = a - 1, b - a + 1, str(dest / "seams" / f"s{a:08d}-f%08d.jpg")
+    scale = f"scale='min({size},iw)':'min({size},ih)':force_original_aspect_ratio=decrease"
+    run(
+        [
+            "ffmpeg", "-v", "error", "-y", *seek,
+            "-i", source, "-map", "0:v:0", "-an", "-frames:v", str(count),
+            "-vf", scale, "-fps_mode", "passthrough", "-q:v", "3",
+            "-start_number", str(first), pattern,
+        ]
+    )  # fmt: skip
+
+
+def finish_segment(dest: Path, a: int, b: int) -> None:
+    """Prove segment [a, b) starts on the intended frame, then move it into the sequence."""
+    if a == 0:
+        written = [dest / f"f{i:08d}.jpg" for i in range(b)]
+        if not all(f.is_file() for f in written):
+            raise ValueError("Some frames were not decoded; refusing incomplete evidence")
+        return
+    written = sorted((dest / "seams").glob(f"s{a:08d}-f*.jpg"))
+    if len(written) != b - a + 1:
+        raise ValueError("Parallel decode returned a different frame count")
+    head, *rest = written
+    if head.read_bytes() != (dest / f"f{a - 1:08d}.jpg").read_bytes():
+        raise ValueError("Parallel decode seam does not match; refusing shifted evidence")
+    for f in rest:
+        f.replace(dest / f"f{int(f.stem.split('-f')[1]):08d}.jpg")
+    head.unlink()
+
+
+def detect_segment(job: tuple) -> list[int]:
+    """Indices in [a, b) where a new shot starts. Detectors keep a short history and
+    AdaptiveDetector judges a frame two frames later, so the segment replays frames from
+    `start` and reads on to `end` past b; the union over segments equals one pass."""
+    pattern, fps, start, a, b, end, threshold = job
+    from scenedetect.backends.opencv import VideoStreamCv2
+
+    video = VideoStreamCv2(pattern, framerate=fps)
+    if start:
+        video.seek(start)
+    manager = SceneManager()
+    manager.add_detector(ContentDetector(threshold=threshold, min_scene_len=1))
+    manager.add_detector(AdaptiveDetector(min_scene_len=1))
+    if manager.detect_scenes(video, duration=end - start, show_progress=False) != end - start:
+        raise ValueError("Scene detector did not decode every frame of its segment")
+    starts = [s[0].get_frames() for s in manager.get_scene_list(start_in_scene=True)]
+    return [i for i in starts if a <= i < b and i > 0]

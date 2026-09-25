@@ -329,6 +329,43 @@ def test_termination_stops_owned_media_child(tmp_path):
                 pass
 
 
+def test_segment_scan_keeps_low_contrast_cuts_near_its_end(tmp_path):
+    import cv2
+    import numpy as np
+
+    for i in range(64):
+        cv2.imwrite(str(tmp_path / f"f{i:08d}.jpg"), np.full((64, 64, 3), 60 * (i == 38), np.uint8))
+    pattern = str(tmp_path / "f%08d.jpg")
+    whole = media.detect_segment((pattern, 25.0, 0, 0, 64, 64, 27.0))
+    assert whole  # AdaptiveDetector alone fires here: the content score stays below 27
+    split = media.detect_segment((pattern, 25.0, 0, 0, 40, 48, 27.0))
+    split += media.detect_segment((pattern, 25.0, 8, 40, 64, 64, 27.0))
+    assert split == whole
+
+
+def test_precision_segments_reproduce_one_pass_evidence(clip, tmp_path, monkeypatch):
+    from openscenesense.montage import quality_plan
+
+    args = args_for(clip, tmp_path)
+    args.source_offset, args.core_frames, args.context_frames = 0, 16, 4
+    args.max_frames_total = 1000
+    args.output.mkdir()
+    whole = quality_plan.prepare(args)
+    monkeypatch.setattr(quality_plan.PlanBuilder, "SEGMENT", 7)
+    args.output = tmp_path / "segmented"
+    args.output.mkdir()
+    plan, feed = quality_plan.start_plan(args)
+    published = []
+    while not feed.done:
+        published += feed.take(1)
+    published += feed.take(0)
+    assert feed.error is None
+    assert published == list(range(len(plan["windows"])))
+    assert [f["sha256"] for f in plan["frames"]] == [f["sha256"] for f in whole["frames"]]
+    assert plan["candidates"] == whole["candidates"]
+    assert plan["windows"] == whole["windows"]
+
+
 def test_precision_prepares_all_real_frames_and_checks_resume_integrity(clip, tmp_path):
     from openscenesense.montage.quality_plan import prepare
 

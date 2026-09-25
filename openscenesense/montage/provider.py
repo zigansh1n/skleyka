@@ -3,7 +3,10 @@ from __future__ import annotations
 import base64
 import json
 import os
+import re
+import secrets
 import stat
+import threading
 import time
 from pathlib import Path
 from urllib.parse import urlsplit
@@ -77,6 +80,27 @@ def validate_analysis(data: dict, frame_count: int) -> dict:
     return data
 
 
+_CLIENTS: dict = {}
+_CLIENTS_GUARD = threading.Lock()
+
+
+def shared_client(factory) -> httpx.Client:
+    """One pooled client per process: a fresh client costs ~30 ms of CPU loading CA
+    certificates, and a fresh TLS connection one more round trip per request."""
+    with _CLIENTS_GUARD:
+        if factory not in _CLIENTS:
+            _CLIENTS[factory] = factory(
+                timeout=httpx.Timeout(300, connect=30),
+                follow_redirects=False,
+                limits=httpx.Limits(max_connections=None, max_keepalive_connections=2000),
+            )
+        return _CLIENTS[factory]
+
+
+class TransientAPIError(RuntimeError):
+    """Overload or gateway failure: the same request may succeed later."""
+
+
 class VisionAPI:
     def __init__(self, config: dict, max_attempts: int = 2):
         allowed = {
@@ -102,6 +126,8 @@ class VisionAPI:
     def request(self, prompt: str, frames: list[tuple[Path, float]]) -> dict:
         mode = self.config["MONTAGE_API_MODE"]
         content = [{"type": "input_text" if mode == "responses" else "text", "text": prompt}]
+        # A per-request random slot cannot collide with prompt or transcript text.
+        slot, images = f"@@{secrets.token_hex(8)}:%d@@", []
         for i, (path, timestamp) in enumerate(frames, 1):
             content.append(
                 {
@@ -109,7 +135,8 @@ class VisionAPI:
                     "text": f"Frame {i}; absolute source time {timestamp:.6f} seconds",
                 }
             )
-            url = "data:image/jpeg;base64," + base64.b64encode(path.read_bytes()).decode()
+            images.append(base64.b64encode(path.read_bytes()))
+            url = slot % (len(images) - 1)
             if mode == "responses":
                 content.append({"type": "input_image", "image_url": url, "detail": "high"})
             else:
@@ -138,29 +165,48 @@ class VisionAPI:
                 payload["thinking"] = {"type": "disabled" if effort == "none" else "enabled"}
                 if effort != "none":
                     payload["reasoning_effort"] = effort
-        headers = {"Authorization": "Bearer " + self.config["MONTAGE_API_KEY"]}
+            if urlsplit(self.config["MONTAGE_BASE_URL"]).hostname.endswith(".aliyuncs.com"):
+                # DashScope: thinking is a separate switch. One JSON body instead of SSE:
+                # hundreds of parallel token streams saturate the GIL parsing events.
+                payload["enable_thinking"] = effort != "none"
+                if effort != "none":
+                    payload["reasoning_effort"] = effort
+                payload["stream"] = False
+            # Provider-specific extras, merged last, e.g. {"enable_thinking": false}.
+            if self.config.get("MONTAGE_EXTRA_BODY"):
+                payload.update(json.loads(self.config["MONTAGE_EXTRA_BODY"]))
+        # Base64 is JSON-safe, so frames are spliced in as bytes: running megabytes of image
+        # data through json.dumps held the GIL for most of a many-worker run.
+        marker = re.escape(slot.split(":")[0].encode()) + rb":(\d+)@@"
+        skeleton = re.split(marker, json.dumps(payload, ensure_ascii=False).encode())
+        body = b"".join(
+            part if n % 2 == 0 else b"data:image/jpeg;base64," + images[int(part)]
+            for n, part in enumerate(skeleton)
+        )
+        headers = {
+            "Authorization": "Bearer " + self.config["MONTAGE_API_KEY"],
+            "Content-Type": "application/json",
+        }
         for attempt in range(self.max_attempts):
             self.calls += 1
-            with httpx.Client(
-                timeout=httpx.Timeout(180, connect=20), follow_redirects=False
-            ) as client:
-                with client.stream(
-                    "POST",
-                    self.config["MONTAGE_BASE_URL"].rstrip("/") + endpoint,
-                    headers=headers,
-                    json=payload,
-                ) as response:
-                    if (
-                        response.status_code in (429, 500, 502, 503, 504)
-                        and attempt + 1 < self.max_attempts
-                    ):
-                        time.sleep(2)
-                        continue
-                    if response.status_code != 200:
-                        raise RuntimeError(
-                            f"Vision API HTTP {response.status_code}; no model fallback"
-                        )
-                    text, usage = self._read(response)
+            client = shared_client(httpx.Client)
+            with client.stream(
+                "POST",
+                self.config["MONTAGE_BASE_URL"].rstrip("/") + endpoint,
+                headers=headers,
+                content=body,
+            ) as response:
+                if (
+                    response.status_code in (429, 500, 502, 503, 504)
+                    and attempt + 1 < self.max_attempts
+                ):
+                    time.sleep(2)
+                    continue
+                if response.status_code in (429, 500, 502, 503, 504):
+                    raise TransientAPIError(f"Vision API HTTP {response.status_code}; retry later")
+                if response.status_code != 200:
+                    raise RuntimeError(f"Vision API HTTP {response.status_code}; no model fallback")
+                text, usage = self._read(response)
             # Keep portable accounting, not gateway-specific per-item attribution payloads.
             self.usage.append(
                 {

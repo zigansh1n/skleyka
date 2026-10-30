@@ -1,5 +1,5 @@
 # Direct dependency freeze for release validation (2026-08-24).
-openai==3.3.1
+openai==3.39.0
 numpy==2.5.2
 opencv-python==5.0.0.93
 Pillow==12.3.0
